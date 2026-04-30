@@ -1,0 +1,26 @@
+[package]
+name = "prodjlink-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+description = "Rust client for Pioneer/AlphaTheta Pro DJ Link status and metadata monitoring"
+license = "MIT"
+repository = "https://github.com/yakoob/compeller.ai"
+readme = "README.md"
+keywords = ["prodjlink", "pioneer", "cdj", "dj", "rekordbox"]
+categories = ["network-programming", "multimedia"]
+
+[dependencies]
+log = "0.4"
+parking_lot = "0.12"
+socket2 = "0.5"
+serde = { version = "1.0", features = ["derive"], optional = true }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+env_logger = "0.11"
