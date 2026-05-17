@@ -29,7 +29,20 @@ fn main() {
         }
 
         if let Some(track) = client.current_track() {
-            println!("master_track={} - {} bpm={:?}", track.artist, track.title, track.bpm);
+            println!(
+                "master_track={} - {} bpm={:?}",
+                track.artist, track.title, track.bpm
+            );
+        }
+
+        if let Some(beat) = client.master_beat() {
+            println!(
+                "master_beat deck={} bpm={:.2} beat_in_measure={} age_ms={}",
+                beat.device_id,
+                beat.bpm,
+                beat.beat_in_measure,
+                beat.last_beat_at.elapsed().as_millis()
+            );
         }
 
         thread::sleep(Duration::from_secs(2));

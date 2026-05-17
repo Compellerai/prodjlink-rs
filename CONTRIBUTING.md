@@ -23,7 +23,7 @@ cargo clippy --all-targets --features serde -- -D warnings
 
 ## Safety
 
-Do not test against a live production DJ network without operator approval. This crate sends Pro DJ Link LAN packets and may bind UDP ports 50000 and 50002.
+Do not test against a live production DJ network without operator approval. This crate sends Pro DJ Link LAN packets and may bind UDP ports 50000, 50001, and 50002.
 
 ## Style
 
