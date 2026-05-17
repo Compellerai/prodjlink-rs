@@ -7,7 +7,7 @@ Compeller built this because REACT needed reliable native Pro DJ Link awareness 
 ## Current scope
 
 - Join a Pro DJ Link LAN as a virtual player.
-- Listen for CDJ status on UDP 50002.
+- Listen for CDJ beat packets on UDP 50001 and CDJ status on UDP 50002.
 - Send keep-alive/status packets on UDP 50000/50002 so players answer us.
 - Track discovered decks, master/play/loop/on-air flags, BPM, source slot, and rekordbox track id.
 - Fetch metadata from the CDJ dbserver over TCP when available.
@@ -76,7 +76,7 @@ Hardware reports are welcome, especially for CDJ-2000NXS2, additional XDJ units,
 
 ## Safety note
 
-This crate sends local LAN broadcast packets and may bind UDP ports 50000 and 50002. Do not run it on a production DJ network unless you understand Pro DJ Link behavior and have operator approval.
+This crate sends local LAN broadcast packets and may bind UDP ports 50000, 50001, and 50002. Do not run it on a production DJ network unless you understand Pro DJ Link behavior and have operator approval.
 
 The crate does not call Compeller services and does not use the internet. It only talks on the local Pro DJ Link network.
 

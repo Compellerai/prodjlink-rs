@@ -51,12 +51,32 @@ pub struct TrackInfo {
     pub artwork: Option<Vec<u8>>,
 }
 
+/// Raw beat-grid facts for the current master deck.
+///
+/// This intentionally does not derive serde because `Instant` is process-local
+/// monotonic time. Integration layers should interpolate phase relative to
+/// `last_beat_at` and serialize their own wall-clock timestamps if needed.
+#[derive(Debug, Clone)]
+pub struct MasterBeat {
+    pub device_id: u8,
+    pub bpm: f32,
+    pub beat_in_measure: u8,
+    pub last_beat_at: Instant,
+}
 
 /// Pro DJ Link packet header magic bytes
 const PRODJLINK_HEADER: [u8; 10] = [0x51, 0x73, 0x70, 0x74, 0x31, 0x57, 0x6d, 0x4a, 0x4f, 0x4c];
 
 /// CDJ status packet type (port 50002)
 const PACKET_TYPE_CDJ_STATUS: u8 = 0x0a;
+
+/// Beat packet type (port 50001)
+const PACKET_TYPE_BEAT: u8 = 0x28;
+
+/// Full Pro DJ Link beat packet length. The protocol field at 0x22-0x23
+/// reports 0x003c bytes after the length field, for 0x60 bytes total.
+const BEAT_PACKET_LEN: usize = 0x60;
+const NOMINAL_PITCH: f32 = 0x0010_0000 as f32;
 
 /// Database query magic bytes
 const DB_MAGIC: [u8; 4] = [0x87, 0x23, 0x49, 0xae];
@@ -155,8 +175,8 @@ struct DeckStatus {
     track_device_id: u8,
     track_slot: u8,
     track_id: u32,
-    #[allow(dead_code)]
     beat_in_measure: u8,
+    last_beat_at: Option<Instant>,
 }
 
 impl ProDjLinkClient {
@@ -181,7 +201,9 @@ impl ProDjLinkClient {
         let listener_thread = thread::Builder::new()
             .name("prodjlink-listener".to_string())
             .spawn(move || {
-                if let Err(e) = Self::listener_loop(thread_state, thread_track_history, thread_running) {
+                if let Err(e) =
+                    Self::listener_loop(thread_state, thread_track_history, thread_running)
+                {
                     log::error!("[ProDjLink] Listener error: {}", e);
                 }
             })
@@ -292,7 +314,13 @@ impl ProDjLinkClient {
 
     /// Build a keep-alive packet (type 0x06) to announce ourselves on the network
     /// Per djl-analysis.deepsymmetry.org: https://djl-analysis.deepsymmetry.org/djl-analysis/startup.html#cdj-keep-alive
-    fn build_keep_alive_packet(device_id: u8, device_name: &str, mac: &[u8; 6], ip: &[u8; 4], peer_count: u8) -> Vec<u8> {
+    fn build_keep_alive_packet(
+        device_id: u8,
+        device_name: &str,
+        mac: &[u8; 6],
+        ip: &[u8; 4],
+        peer_count: u8,
+    ) -> Vec<u8> {
         let mut packet = Vec::with_capacity(54);
 
         // 0x00-0x09: Pro DJ Link magic header
@@ -368,8 +396,16 @@ impl ProDjLinkClient {
 
         log::info!(
             "[ProDjLink] Local IP: {}.{}.{}.{}, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            local_ip[0], local_ip[1], local_ip[2], local_ip[3],
-            local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5]
+            local_ip[0],
+            local_ip[1],
+            local_ip[2],
+            local_ip[3],
+            local_mac[0],
+            local_mac[1],
+            local_mac[2],
+            local_mac[3],
+            local_mac[4],
+            local_mac[5]
         );
 
         // Calculate broadcast address (assume /24 network)
@@ -377,7 +413,8 @@ impl ProDjLinkClient {
         let broadcast_addr: SocketAddr = format!(
             "{}.{}.{}.{}:50000",
             broadcast_ip[0], broadcast_ip[1], broadcast_ip[2], broadcast_ip[3]
-        ).parse()?;
+        )
+        .parse()?;
 
         // Create socket for sending keep-alives (port 50000)
         let announce_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -389,16 +426,23 @@ impl ProDjLinkClient {
             let fd = announce_socket.as_raw_fd();
             unsafe {
                 let optval: libc::c_int = 1;
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
                     &optval as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
             }
         }
         let announce_bind: SocketAddr = "0.0.0.0:50000".parse()?;
         match announce_socket.bind(&announce_bind.into()) {
             Ok(_) => log::info!("[ProDjLink] Bound to UDP port 50000 (announcements)"),
             Err(e) => {
-                log::warn!("[ProDjLink] Failed to bind port 50000: {} - will try listen-only mode", e);
+                log::warn!(
+                    "[ProDjLink] Failed to bind port 50000: {} - will try listen-only mode",
+                    e
+                );
             }
         }
         let announce_socket: UdpSocket = announce_socket.into();
@@ -407,6 +451,7 @@ impl ProDjLinkClient {
         // CDJs will send status directly to us once they see our keep-alives
         let status_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         status_socket.set_reuse_address(true)?;
+        status_socket.set_broadcast(true)?;
         status_socket.set_nonblocking(true)?;
         #[cfg(unix)]
         {
@@ -414,9 +459,13 @@ impl ProDjLinkClient {
             let fd = status_socket.as_raw_fd();
             unsafe {
                 let optval: libc::c_int = 1;
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
                     &optval as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
             }
         }
         let status_bind: SocketAddr = "0.0.0.0:50002".parse()?;
@@ -431,20 +480,71 @@ impl ProDjLinkClient {
         }
         let status_socket: UdpSocket = status_socket.into();
 
+        // Create optional socket to RECEIVE beat packets on port 50001.
+        // Beat packets carry precise beat-edge timing. If another DJ app owns
+        // the port we keep status/metadata monitoring alive and simply run
+        // without beat-edge sync.
+        let beat_socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
+            Ok(socket) => {
+                socket.set_reuse_address(true).ok();
+                socket.set_nonblocking(true).ok();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = socket.as_raw_fd();
+                    unsafe {
+                        let optval: libc::c_int = 1;
+                        libc::setsockopt(
+                            fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_REUSEPORT,
+                            &optval as *const _ as *const libc::c_void,
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                        );
+                    }
+                }
+                let beat_bind: SocketAddr = "0.0.0.0:50001".parse()?;
+                match socket.bind(&beat_bind.into()) {
+                    Ok(_) => {
+                        log::info!("[ProDjLink] Bound to UDP port 50001 (receiving beat packets)");
+                        Some(UdpSocket::from(socket))
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[ProDjLink] Failed to bind port 50001: {} - continuing without beat packets",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "[ProDjLink] Failed to create beat socket: {} - continuing without beat packets",
+                    e
+                );
+                None
+            }
+        };
+
         let device_name = "REACT";
 
         // Broadcast address for status packets (port 50002)
         let status_broadcast_addr: SocketAddr = format!(
             "{}.{}.{}.{}:50002",
             broadcast_ip[0], broadcast_ip[1], broadcast_ip[2], broadcast_ip[3]
-        ).parse()?;
+        )
+        .parse()?;
 
         let mut buf = [0u8; 512];
 
         // Store our local IP to filter out our own packets
-        let local_ip_addr: IpAddr = format!("{}.{}.{}.{}", local_ip[0], local_ip[1], local_ip[2], local_ip[3])
-            .parse()
-            .unwrap();
+        let local_ip_addr: IpAddr = format!(
+            "{}.{}.{}.{}",
+            local_ip[0], local_ip[1], local_ip[2], local_ip[3]
+        )
+        .parse()
+        .unwrap();
 
         // Phase 1: Scan network for 2 seconds to find used device IDs
         log::info!("[ProDjLink] Scanning network for existing CDJs...");
@@ -481,9 +581,16 @@ impl ProDjLinkClient {
             .unwrap_or(7);
 
         if !used_ids.is_empty() {
-            log::info!("[ProDjLink] Found CDJs using IDs: {:?}, selecting ID {}", used_ids, device_id);
+            log::info!(
+                "[ProDjLink] Found CDJs using IDs: {:?}, selecting ID {}",
+                used_ids,
+                device_id
+            );
         } else {
-            log::info!("[ProDjLink] No CDJs found during scan, using ID {}", device_id);
+            log::info!(
+                "[ProDjLink] No CDJs found during scan, using ID {}",
+                device_id
+            );
         }
 
         // Store our device ID in state for metadata fetch to use
@@ -497,17 +604,31 @@ impl ProDjLinkClient {
         let mut last_prune = Instant::now();
         let mut packet_counter: u8 = 0;
 
-        log::info!("[ProDjLink] Joining Pro DJ Link network as '{}' (ID {})...", device_name, device_id);
+        log::info!(
+            "[ProDjLink] Joining Pro DJ Link network as '{}' (ID {})...",
+            device_name,
+            device_id
+        );
 
         while running.load(Ordering::Relaxed) {
             // Send keep-alive announcement every 1.5 seconds on port 50000
             if last_announce.elapsed() >= Duration::from_millis(1500) {
                 // Get peer count (number of CDJs we've discovered)
                 let peer_count = state.lock().devices.len() as u8;
-                let packet = Self::build_keep_alive_packet(device_id, device_name, &local_mac, &local_ip, peer_count);
+                let packet = Self::build_keep_alive_packet(
+                    device_id,
+                    device_name,
+                    &local_mac,
+                    &local_ip,
+                    peer_count,
+                );
                 match announce_socket.send_to(&packet, broadcast_addr) {
                     Ok(_) => {
-                        log::trace!("[ProDjLink] Sent keep-alive to {} (peers: {})", broadcast_addr, peer_count);
+                        log::trace!(
+                            "[ProDjLink] Sent keep-alive to {} (peers: {})",
+                            broadcast_addr,
+                            peer_count
+                        );
                     }
                     Err(e) => {
                         log::debug!("[ProDjLink] Failed to send keep-alive: {}", e);
@@ -519,13 +640,17 @@ impl ProDjLinkClient {
             // Send status packet every 200ms on port 50002 to appear as a real player
             // This is required for metadata queries - CDJs only respond to "real" players
             if last_status.elapsed() >= Duration::from_millis(200) {
-                let status_packet = Self::build_status_packet(device_id, device_name, packet_counter);
+                let status_packet =
+                    Self::build_status_packet(device_id, device_name, packet_counter);
                 packet_counter = packet_counter.wrapping_add(1);
 
                 // Broadcast status to all devices on the network
                 match status_socket.send_to(&status_packet, status_broadcast_addr) {
                     Ok(_) => {
-                        log::trace!("[ProDjLink] Sent status packet (counter: {})", packet_counter);
+                        log::trace!(
+                            "[ProDjLink] Sent status packet (counter: {})",
+                            packet_counter
+                        );
                     }
                     Err(e) => {
                         log::debug!("[ProDjLink] Failed to send status: {}", e);
@@ -576,6 +701,31 @@ impl ProDjLinkClient {
                 }
             }
 
+            // Read beat packets from port 50001.
+            if let Some(socket) = beat_socket.as_ref() {
+                loop {
+                    match socket.recv_from(&mut buf) {
+                        Ok((len, src)) => {
+                            if src.ip() == local_ip_addr {
+                                continue;
+                            }
+                            if len >= 11
+                                && buf[..10] == PRODJLINK_HEADER
+                                && buf[0x0a] == PACKET_TYPE_BEAT
+                            {
+                                Self::parse_beat(&buf[..len], src.ip(), &state);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+                        Err(e) => {
+                            log::info!("[ProDjLink] Port 50001 recv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Also check port 50000 for other device announcements (to discover CDJs)
             announce_socket.set_nonblocking(true).ok();
             if let Ok((len, src)) = announce_socket.recv_from(&mut buf) {
@@ -588,21 +738,29 @@ impl ProDjLinkClient {
 
                         // Device name: bytes 0x0c to 0x1f (12-31), 20 bytes max
                         let name_bytes = &buf[0x0c..0x20.min(len)];
-                        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
-                        let name = String::from_utf8_lossy(&name_bytes[..name_end]).trim().to_string();
+                        let name_end = name_bytes
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(name_bytes.len());
+                        let name = String::from_utf8_lossy(&name_bytes[..name_end])
+                            .trim()
+                            .to_string();
 
                         if peer_id != device_id && (1..=6).contains(&peer_id) {
                             let mut st = state.lock();
                             let is_new = !st.devices.contains_key(&peer_id);
 
                             // Update or insert device (will get full status from port 50002)
-                            st.devices.entry(peer_id).or_insert_with(|| CDJDevice {
-                                device_id: peer_id,
-                                name: name.clone(),
-                                ip: src.ip(),
-                                last_seen: Instant::now(),
-                                status: DeckStatus::default(),
-                            }).last_seen = Instant::now();
+                            st.devices
+                                .entry(peer_id)
+                                .or_insert_with(|| CDJDevice {
+                                    device_id: peer_id,
+                                    name: name.clone(),
+                                    ip: src.ip(),
+                                    last_seen: Instant::now(),
+                                    status: DeckStatus::default(),
+                                })
+                                .last_seen = Instant::now();
 
                             // Also update name if we got a better one
                             if !name.is_empty() {
@@ -616,7 +774,9 @@ impl ProDjLinkClient {
                             if is_new {
                                 log::info!(
                                     "[ProDjLink] Discovered CDJ: {} (ID {}) at {}",
-                                    name, peer_id, src.ip()
+                                    name,
+                                    peer_id,
+                                    src.ip()
                                 );
                             }
                         }
@@ -673,11 +833,95 @@ impl ProDjLinkClient {
                 let channel_bit = 1u8 << (device.device_id - 1);
                 let new_on_air = (on_air_mask & channel_bit) != 0;
                 if device.status.is_on_air != new_on_air {
-                    log::info!("[ProDjLink] Deck {} on-air: {} -> {} (mixer)", device.device_id, device.status.is_on_air, new_on_air);
+                    log::info!(
+                        "[ProDjLink] Deck {} on-air: {} -> {} (mixer)",
+                        device.device_id,
+                        device.status.is_on_air,
+                        new_on_air
+                    );
                     device.status.is_on_air = new_on_air;
                 }
             }
         }
+    }
+
+    /// Parse a beat packet (type 0x28 on port 50001).
+    fn parse_beat(data: &[u8], src_ip: IpAddr, state: &Arc<Mutex<ProDjLinkState>>) {
+        let Some((device_id, bpm, beat_in_measure)) = Self::decode_beat_packet(data) else {
+            return;
+        };
+
+        let our_id = state.lock().our_device_id;
+        if !(1..=6).contains(&device_id) || device_id == our_id {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut st = state.lock();
+        let device = st.devices.entry(device_id).or_insert_with(|| CDJDevice {
+            device_id,
+            name: format!("CDJ {}", device_id),
+            ip: src_ip,
+            last_seen: now,
+            status: DeckStatus::default(),
+        });
+
+        device.ip = src_ip;
+        device.last_seen = now;
+        device.status.bpm = Some(bpm);
+        device.status.beat_in_measure = beat_in_measure;
+        device.status.last_beat_at = Some(now);
+
+        log::trace!(
+            "[ProDjLink] Beat deck={} bpm={:.2} beat_in_measure={}",
+            device_id,
+            bpm,
+            beat_in_measure
+        );
+    }
+
+    fn decode_beat_packet(data: &[u8]) -> Option<(u8, f32, u8)> {
+        if data.len() < BEAT_PACKET_LEN || data[..10] != PRODJLINK_HEADER {
+            return None;
+        }
+        if data[0x0a] != PACKET_TYPE_BEAT {
+            return None;
+        }
+
+        let device_id = data[0x21];
+        if !(1..=6).contains(&device_id) {
+            return None;
+        }
+
+        let len_r = u16::from_be_bytes([data[0x22], data[0x23]]);
+        if len_r != 0x003c {
+            log::trace!("[ProDjLink] Unexpected beat packet len_r: 0x{:04x}", len_r);
+        }
+
+        let duplicate_device_id = data[0x5f];
+        if duplicate_device_id != device_id {
+            log::trace!(
+                "[ProDjLink] Beat packet duplicate device mismatch: {} != {}",
+                duplicate_device_id,
+                device_id
+            );
+        }
+
+        let raw_pitch = u32::from_be_bytes([data[0x54], data[0x55], data[0x56], data[0x57]]);
+        let raw_bpm = u16::from_be_bytes([data[0x5a], data[0x5b]]);
+        let beat_in_measure = data[0x5c];
+        if raw_bpm == 0 || raw_bpm >= 30000 || !(1..=4).contains(&beat_in_measure) {
+            return None;
+        }
+
+        let track_bpm = raw_bpm as f32 / 100.0;
+        let bpm = if raw_pitch == 0 {
+            track_bpm
+        } else {
+            track_bpm * (raw_pitch as f32 / NOMINAL_PITCH)
+        };
+
+        Some((device_id, bpm, beat_in_measure))
     }
 
     /// Parse a CDJ status packet (type 0x0a on port 50002)
@@ -745,7 +989,7 @@ impl ProDjLinkClient {
         // Beat in measure at offset 0xA6 (1-4) - check bounds
         let beat_in_measure = if data.len() > 0xA6 { data[0xA6] } else { 0 };
 
-        let new_status = DeckStatus {
+        let mut new_status = DeckStatus {
             track_loaded,
             is_playing,
             is_looping,
@@ -756,12 +1000,20 @@ impl ProDjLinkClient {
             track_slot,
             track_id,
             beat_in_measure,
+            last_beat_at: None,
         };
 
         // Quick lock to check state and update - minimize lock duration
         let (is_new, track_changed, cached_title, cached_artist) = {
             let mut state = state.lock();
             let is_new = !state.devices.contains_key(&device_id);
+
+            if let Some(existing) = state.devices.get(&device_id) {
+                new_status.last_beat_at = existing.status.last_beat_at;
+                if new_status.beat_in_measure == 0 {
+                    new_status.beat_in_measure = existing.status.beat_in_measure;
+                }
+            }
 
             // Check if track changed
             let track_changed = if let Some(existing) = state.devices.get(&device_id) {
@@ -782,7 +1034,9 @@ impl ProDjLinkClient {
                     slot: track_slot,
                     track_id,
                 };
-                state.metadata_cache.get(&metadata_key)
+                state
+                    .metadata_cache
+                    .get(&metadata_key)
                     .map(|m| (Some(m.title.clone()), Some(m.artist.clone())))
                     .unwrap_or((None, None))
             } else {
@@ -864,8 +1118,13 @@ impl ProDjLinkClient {
         track_id: u32,
         state: &Arc<Mutex<ProDjLinkState>>,
     ) -> Option<TrackMetadata> {
-        log::debug!("[ProDjLink] Fetching metadata: device={}, slot={}, track={} from {}",
-            track_device_id, track_slot, track_id, device_ip);
+        log::debug!(
+            "[ProDjLink] Fetching metadata: device={}, slot={}, track={} from {}",
+            track_device_id,
+            track_slot,
+            track_id,
+            device_ip
+        );
 
         // First try to discover the dbserver port (CDJ-3000 might use different port)
         let db_port = Self::discover_dbserver_port(device_ip).unwrap_or(1051);
@@ -878,12 +1137,19 @@ impl ProDjLinkClient {
                 s
             }
             Err(e) => {
-                log::warn!("[ProDjLink] TCP connect failed {}:{} - {}", device_ip, db_port, e);
+                log::warn!(
+                    "[ProDjLink] TCP connect failed {}:{} - {}",
+                    device_ip,
+                    db_port,
+                    e
+                );
                 return None;
             }
         };
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
         stream.set_nodelay(true).ok()?;
 
         // Get our virtual device ID from state (dynamically selected during network scan)
@@ -932,7 +1198,10 @@ impl ProDjLinkClient {
         if n2 >= 13 {
             let setup_type = u16::from_be_bytes([setup_resp[11], setup_resp[12]]);
             if setup_type != 0x4000 {
-                log::debug!("[ProDjLink] Setup response type=0x{:04x} (expected 0x4000)", setup_type);
+                log::debug!(
+                    "[ProDjLink] Setup response type=0x{:04x} (expected 0x4000)",
+                    setup_type
+                );
             }
         }
 
@@ -940,7 +1209,8 @@ impl ProDjLinkClient {
         std::thread::sleep(Duration::from_millis(150));
 
         // Step 3: Request track metadata (type 0x2002)
-        let metadata_req = Self::build_metadata_request(our_device_id, track_device_id, track_slot, track_id);
+        let metadata_req =
+            Self::build_metadata_request(our_device_id, track_device_id, track_slot, track_id);
         stream.write_all(&metadata_req).ok()?;
 
         let mut header = [0u8; 256];
@@ -965,18 +1235,27 @@ impl ProDjLinkClient {
         // Extract menu_size from arg2
         let mut menu_size: u32 = 16;
         if resp_type == 0x4000 && n >= 32 && header[15] == 0x14 {
-            let argtypes_len = u32::from_be_bytes([header[16], header[17], header[18], header[19]]) as usize;
+            let argtypes_len =
+                u32::from_be_bytes([header[16], header[17], header[18], header[19]]) as usize;
             let args_start = 20 + argtypes_len;
-            if n >= args_start + 10 && header[args_start] == 0x11 && header[args_start + 5] == 0x11 {
+            if n >= args_start + 10 && header[args_start] == 0x11 && header[args_start + 5] == 0x11
+            {
                 menu_size = u32::from_be_bytes([
-                    header[args_start + 6], header[args_start + 7],
-                    header[args_start + 8], header[args_start + 9],
+                    header[args_start + 6],
+                    header[args_start + 7],
+                    header[args_start + 8],
+                    header[args_start + 9],
                 ]);
             }
         }
 
-        log::debug!("[ProDjLink] Metadata: type=0x{:04x}, txid={}, argc={}, menu_size={}",
-            resp_type, resp_txid, resp_argc, menu_size);
+        log::debug!(
+            "[ProDjLink] Metadata: type=0x{:04x}, txid={}, argc={}, menu_size={}",
+            resp_type,
+            resp_txid,
+            resp_argc,
+            menu_size
+        );
 
         if resp_type == 0x4003 {
             log::debug!("[ProDjLink] Track metadata not available (0x4003)");
@@ -989,7 +1268,15 @@ impl ProDjLinkClient {
 
         // Step 4: Render request (type 0x3000) to get actual metadata strings
         let render_txid = resp_txid.wrapping_add(1);
-        let render_req = Self::build_render_request(our_device_id, track_device_id, track_slot, track_id, menu_size, menu_size, render_txid);
+        let render_req = Self::build_render_request(
+            our_device_id,
+            track_device_id,
+            track_slot,
+            track_id,
+            menu_size,
+            menu_size,
+            render_txid,
+        );
         stream.write_all(&render_req).ok()?;
 
         // Read initial TCP response
@@ -999,8 +1286,12 @@ impl ProDjLinkClient {
         // Log framing info + first 32 bytes only
         if ack_n >= 13 {
             let ack_type = u16::from_be_bytes([ack_buf[11], ack_buf[12]]);
-            log::debug!("[ProDjLink] Render ack: {} bytes, type=0x{:04x}, first32={:02x?}",
-                ack_n, ack_type, &ack_buf[..ack_n.min(32)]);
+            log::debug!(
+                "[ProDjLink] Render ack: {} bytes, type=0x{:04x}, first32={:02x?}",
+                ack_n,
+                ack_type,
+                &ack_buf[..ack_n.min(32)]
+            );
         }
 
         // CDJ-3000 commonly streams render rows back on TCP after the ack
@@ -1014,7 +1305,9 @@ impl ProDjLinkClient {
         std::thread::sleep(Duration::from_millis(300));
         let menu_packets: Vec<Vec<u8>> = {
             let mut s = state.lock();
-            let packets: Vec<Vec<u8>> = s.pending_metadata_packets.iter()
+            let packets: Vec<Vec<u8>> = s
+                .pending_metadata_packets
+                .iter()
                 .filter(|p| p.device_id == track_device_id || p.source_ip == device_ip)
                 .map(|p| p.data.clone())
                 .collect();
@@ -1023,7 +1316,11 @@ impl ProDjLinkClient {
         };
 
         if !menu_packets.is_empty() {
-            log::debug!("[ProDjLink] Trying {} filtered UDP packets from device {}", menu_packets.len(), track_device_id);
+            log::debug!(
+                "[ProDjLink] Trying {} filtered UDP packets from device {}",
+                menu_packets.len(),
+                track_device_id
+            );
             Self::parse_menu_packets(&menu_packets)
         } else {
             None
@@ -1082,11 +1379,18 @@ impl ProDjLinkClient {
         }
 
         if title.is_empty() {
-            log::debug!("[ProDjLink] No title found in {} UDP packets", packets.len());
+            log::debug!(
+                "[ProDjLink] No title found in {} UDP packets",
+                packets.len()
+            );
             return None;
         }
 
-        log::debug!("[ProDjLink] Parsed from UDP: \"{}\" by \"{}\"", title, artist);
+        log::debug!(
+            "[ProDjLink] Parsed from UDP: \"{}\" by \"{}\"",
+            title,
+            artist
+        );
 
         Some(TrackMetadata {
             title,
@@ -1140,7 +1444,12 @@ impl ProDjLinkClient {
     /// Format: Each header field wrapped in NumberField/BinaryField with type tag
     /// Args: [menu_field, track_id] where menu_field = [our_device, 1, slot, track_type]
     /// NOTE: menu_field must use OUR announced device ID - CDJ validates this!
-    fn build_metadata_request(our_device_id: u8, _source_device_id: u8, slot: u8, track_id: u32) -> Vec<u8> {
+    fn build_metadata_request(
+        our_device_id: u8,
+        _source_device_id: u8,
+        slot: u8,
+        track_id: u32,
+    ) -> Vec<u8> {
         let mut packet = Vec::with_capacity(60);
 
         // Start marker: NumberField(magic, 4)
@@ -1183,7 +1492,15 @@ impl ProDjLinkClient {
     /// Build render request (type 0x3000) - fetch actual metadata items
     /// Per dysentery: args are [menu_field, offset, count, 0, total, 0]
     /// The menu was already created in Step 3 with the track_id
-    fn build_render_request(our_device_id: u8, _source_device_id: u8, slot: u8, _track_id: u32, count: u32, total: u32, txid: u32) -> Vec<u8> {
+    fn build_render_request(
+        our_device_id: u8,
+        _source_device_id: u8,
+        slot: u8,
+        _track_id: u32,
+        count: u32,
+        total: u32,
+        txid: u32,
+    ) -> Vec<u8> {
         let mut packet = Vec::with_capacity(100);
 
         // Start marker: NumberField(magic, 4)
@@ -1250,23 +1567,28 @@ impl ProDjLinkClient {
         #[derive(Debug, Clone, Copy, PartialEq)]
         enum ParseState {
             WaitingForData,
-            ReceivedHeader,   // Got 0x4001
-            ReceivingRows,    // Getting 0x4101 rows
-            Complete,         // Got 0x4201 footer or found enough data
+            ReceivedHeader, // Got 0x4001
+            ReceivingRows,  // Getting 0x4101 rows
+            Complete,       // Got 0x4201 footer or found enough data
         }
 
         let mut state = ParseState::WaitingForData;
         let mut all_data = Vec::with_capacity(16 * 1024);
         let mut consecutive_timeouts = 0;
-        const MAX_TIMEOUT_STREAK: u32 = 3;  // Break after 3 consecutive timeouts
-        const READ_TIMEOUT_MS: u64 = 350;   // Per-read timeout
+        const MAX_TIMEOUT_STREAK: u32 = 3; // Break after 3 consecutive timeouts
+        const READ_TIMEOUT_MS: u64 = 350; // Per-read timeout
 
-        stream.set_read_timeout(Some(Duration::from_millis(READ_TIMEOUT_MS))).ok();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(READ_TIMEOUT_MS)))
+            .ok();
 
         let start = Instant::now();
-        let max_duration = Duration::from_millis(2000);  // Overall timeout
+        let max_duration = Duration::from_millis(2000); // Overall timeout
 
-        while start.elapsed() < max_duration && all_data.len() < 64 * 1024 && state != ParseState::Complete {
+        while start.elapsed() < max_duration
+            && all_data.len() < 64 * 1024
+            && state != ParseState::Complete
+        {
             let mut buf = [0u8; 4096];
             match stream.read(&mut buf) {
                 Ok(0) => {
@@ -1274,7 +1596,7 @@ impl ProDjLinkClient {
                     break; // EOF
                 }
                 Ok(n) => {
-                    consecutive_timeouts = 0;  // Reset timeout streak
+                    consecutive_timeouts = 0; // Reset timeout streak
                     all_data.extend_from_slice(&buf[..n]);
 
                     // Parse incrementally to detect message types
@@ -1312,14 +1634,23 @@ impl ProDjLinkClient {
                         }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                       || e.kind() == std::io::ErrorKind::TimedOut => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     consecutive_timeouts += 1;
-                    log::trace!("[ProDjLink] TCP: timeout {} of {}", consecutive_timeouts, MAX_TIMEOUT_STREAK);
+                    log::trace!(
+                        "[ProDjLink] TCP: timeout {} of {}",
+                        consecutive_timeouts,
+                        MAX_TIMEOUT_STREAK
+                    );
 
                     // If we have data and hit timeout streak, we're probably done
                     if consecutive_timeouts >= MAX_TIMEOUT_STREAK && !all_data.is_empty() {
-                        log::debug!("[ProDjLink] TCP: Timeout streak reached with {} bytes, processing", all_data.len());
+                        log::debug!(
+                            "[ProDjLink] TCP: Timeout streak reached with {} bytes, processing",
+                            all_data.len()
+                        );
                         break;
                     }
                     continue;
@@ -1343,11 +1674,23 @@ impl ProDjLinkClient {
             let txid = u32::from_be_bytes([all_data[6], all_data[7], all_data[8], all_data[9]]);
             let msg_type = u16::from_be_bytes([all_data[11], all_data[12]]);
             let argc = if total_read > 14 { all_data[14] } else { 0 };
-            log::info!("[ProDjLink] TCP render: {} bytes, type=0x{:04x}, txid={}, argc={}, state={:?}",
-                total_read, msg_type, txid, argc, state);
-            log::debug!("[ProDjLink] TCP first 64 bytes: {:02x?}", &all_data[..total_read.min(64)]);
+            log::info!(
+                "[ProDjLink] TCP render: {} bytes, type=0x{:04x}, txid={}, argc={}, state={:?}",
+                total_read,
+                msg_type,
+                txid,
+                argc,
+                state
+            );
+            log::debug!(
+                "[ProDjLink] TCP first 64 bytes: {:02x?}",
+                &all_data[..total_read.min(64)]
+            );
         } else {
-            log::info!("[ProDjLink] TCP render: {} bytes (too short for header)", total_read);
+            log::info!(
+                "[ProDjLink] TCP render: {} bytes (too short for header)",
+                total_read
+            );
         }
 
         // Scan through all data looking for UTF-16BE strings (0x26 prefix)
@@ -1400,11 +1743,18 @@ impl ProDjLinkClient {
         }
 
         if title.is_empty() {
-            log::warn!("[ProDjLink] No title found in {} bytes of render data", total_read);
+            log::warn!(
+                "[ProDjLink] No title found in {} bytes of render data",
+                total_read
+            );
             return None;
         }
 
-        log::info!("[ProDjLink] Parsed metadata: \"{}\" by \"{}\"", title, artist);
+        log::info!(
+            "[ProDjLink] Parsed metadata: \"{}\" by \"{}\"",
+            title,
+            artist
+        );
 
         Some(TrackMetadata {
             title,
@@ -1434,8 +1784,11 @@ impl ProDjLinkClient {
             // Check debounce: don't fetch if track changed too recently
             if let Some(change_time) = state.last_track_change.get(&source_device_id) {
                 if change_time.elapsed() < Duration::from_millis(DEBOUNCE_DELAY_MS) {
-                    log::trace!("[ProDjLink] Debouncing metadata fetch for device {} ({}ms since change)",
-                        source_device_id, change_time.elapsed().as_millis());
+                    log::trace!(
+                        "[ProDjLink] Debouncing metadata fetch for device {} ({}ms since change)",
+                        source_device_id,
+                        change_time.elapsed().as_millis()
+                    );
                     return;
                 }
             }
@@ -1455,7 +1808,8 @@ impl ProDjLinkClient {
             .spawn(move || {
                 log::debug!(
                     "[ProDjLink] Fetching metadata for track {} from {}",
-                    key.track_id, device_ip
+                    key.track_id,
+                    device_ip
                 );
 
                 let metadata =
@@ -1465,11 +1819,7 @@ impl ProDjLinkClient {
                 state.pending_fetches.remove(&key_clone);
 
                 if let Some(m) = metadata {
-                    log::info!(
-                        "[ProDjLink] Got metadata: \"{}\" by {}",
-                        m.title,
-                        m.artist
-                    );
+                    log::info!("[ProDjLink] Got metadata: \"{}\" by {}", m.title, m.artist);
                     // Limit cache size
                     if state.metadata_cache.len() >= 500 {
                         // Remove oldest entry
@@ -1503,7 +1853,6 @@ impl Drop for ProDjLinkClient {
         }
     }
 }
-
 
 impl ProDjLinkClient {
     /// Source name used by REACT and other integrations.
@@ -1565,6 +1914,18 @@ impl ProDjLinkClient {
         })
     }
 
+    /// Get the latest beat-grid facts from the current master deck.
+    pub fn master_beat(&self) -> Option<MasterBeat> {
+        let state = self.state.lock();
+        let master = state.devices.values().find(|d| d.status.is_master)?;
+        Some(MasterBeat {
+            device_id: master.device_id,
+            bpm: master.status.bpm?,
+            beat_in_measure: master.status.beat_in_measure,
+            last_beat_at: master.status.last_beat_at?,
+        })
+    }
+
     /// Check whether any CDJ devices are currently visible.
     pub fn is_available(&self) -> bool {
         !self.state.lock().devices.is_empty()
@@ -1595,12 +1956,20 @@ impl ProDjLinkClient {
         if device_count == 0 {
             "CDJ: Scanning network...".to_string()
         } else {
-            let names: Vec<String> = state.devices.values()
+            let names: Vec<String> = state
+                .devices
+                .values()
                 .map(|d| {
                     let mut flags = String::new();
-                    if d.status.is_master { flags.push_str("[M]"); }
-                    if d.status.is_playing { flags.push_str("[play]"); }
-                    if d.status.is_looping { flags.push_str("[loop]"); }
+                    if d.status.is_master {
+                        flags.push_str("[M]");
+                    }
+                    if d.status.is_playing {
+                        flags.push_str("[play]");
+                    }
+                    if d.status.is_looping {
+                        flags.push_str("[loop]");
+                    }
                     if flags.is_empty() {
                         d.name.clone()
                     } else {
@@ -1615,7 +1984,9 @@ impl ProDjLinkClient {
     /// Get list of discovered devices
     pub fn get_devices(&self) -> Vec<(u8, String, bool)> {
         let state = self.state.lock();
-        state.devices.values()
+        state
+            .devices
+            .values()
             .map(|d| (d.device_id, d.name.clone(), d.status.is_master))
             .collect()
     }
@@ -1647,41 +2018,45 @@ impl ProDjLinkClient {
         }];
 
         // Collect device info with metadata lookups (exclude our own device)
-        devices.extend(state.devices.values()
-            .filter(|d| d.device_id != our_id)
-            .map(|d| {
-                // Look up track metadata from cache
-                let key = MetadataKey {
-                    device_id: d.status.track_device_id,
-                    slot: d.status.track_slot,
-                    track_id: d.status.track_id,
-                };
-                let metadata = state.metadata_cache.get(&key);
+        devices.extend(
+            state
+                .devices
+                .values()
+                .filter(|d| d.device_id != our_id)
+                .map(|d| {
+                    // Look up track metadata from cache
+                    let key = MetadataKey {
+                        device_id: d.status.track_device_id,
+                        slot: d.status.track_slot,
+                        track_id: d.status.track_id,
+                    };
+                    let metadata = state.metadata_cache.get(&key);
 
-                CdjDeviceInfo {
-                    device_id: d.device_id,
-                    name: d.name.clone(),
-                    ip: d.ip,
-                    track_loaded: d.status.track_loaded,
-                    is_playing: d.status.is_playing,
-                    is_looping: d.status.is_looping,
-                    is_master: d.status.is_master,
-                    is_on_air: d.status.is_on_air,
-                    bpm: d.status.bpm,
-                    track_title: metadata.map(|m| m.title.clone()),
-                    track_artist: metadata.map(|m| m.artist.clone()),
-                }
-            })
+                    CdjDeviceInfo {
+                        device_id: d.device_id,
+                        name: d.name.clone(),
+                        ip: d.ip,
+                        track_loaded: d.status.track_loaded,
+                        is_playing: d.status.is_playing,
+                        is_looping: d.status.is_looping,
+                        is_master: d.status.is_master,
+                        is_on_air: d.status.is_on_air,
+                        bpm: d.status.bpm,
+                        track_title: metadata.map(|m| m.title.clone()),
+                        track_artist: metadata.map(|m| m.artist.clone()),
+                    }
+                }),
         );
 
         // Collect pending fetches info
-        let pending_fetches: std::collections::HashSet<MetadataKey> =
-            state.pending_fetches.clone();
+        let pending_fetches: std::collections::HashSet<MetadataKey> = state.pending_fetches.clone();
 
         // Collect devices that need metadata fetches
         // Use the track source device's IP, not the playing device's IP
         // Include playing device_id for debounce tracking
-        let devices_needing_fetch: Vec<(IpAddr, MetadataKey, u8)> = state.devices.values()
+        let devices_needing_fetch: Vec<(IpAddr, MetadataKey, u8)> = state
+            .devices
+            .values()
             .filter(|d| d.status.track_loaded && d.status.track_id != 0)
             .filter_map(|d| {
                 let key = MetadataKey {
@@ -1691,10 +2066,12 @@ impl ProDjLinkClient {
                 };
                 if !state.metadata_cache.contains_key(&key) && !pending_fetches.contains(&key) {
                     // Get IP of the device that owns the media (track_device_id)
-                    let source_ip = state.devices.get(&d.status.track_device_id)
+                    let source_ip = state
+                        .devices
+                        .get(&d.status.track_device_id)
                         .map(|src| src.ip)
                         .unwrap_or(d.ip); // Fallback to playing device
-                    Some((source_ip, key, d.device_id))  // Include playing device ID for debounce
+                    Some((source_ip, key, d.device_id)) // Include playing device ID for debounce
                 } else {
                     None
                 }
@@ -1734,7 +2111,9 @@ impl ProDjLinkClient {
                 record.artist = Some(artist.to_string());
                 log::info!(
                     "[ProDjLink] Updated history record for track {}: \"{}\" by \"{}\"",
-                    track_id, title, artist
+                    track_id,
+                    title,
+                    artist
                 );
             }
         }
@@ -1743,3 +2122,78 @@ impl ProDjLinkClient {
 
 /// Backward-compatible alias for code that used the REACT-internal name.
 pub type ProDjLinkSource = ProDjLinkClient;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> Arc<Mutex<ProDjLinkState>> {
+        Arc::new(Mutex::new(ProDjLinkState {
+            devices: HashMap::new(),
+            metadata_cache: HashMap::new(),
+            pending_fetches: std::collections::HashSet::new(),
+            last_error: None,
+            pending_metadata_packets: Vec::new(),
+            our_device_id: 6,
+            last_track_change: HashMap::new(),
+        }))
+    }
+
+    fn synthetic_beat_packet(device_id: u8, bpm_x100: u16, beat_in_measure: u8) -> Vec<u8> {
+        let mut packet = vec![0u8; BEAT_PACKET_LEN];
+        packet[..10].copy_from_slice(&PRODJLINK_HEADER);
+        packet[0x0a] = PACKET_TYPE_BEAT;
+        packet[0x21] = device_id;
+        packet[0x22..0x24].copy_from_slice(&0x003c_u16.to_be_bytes());
+        packet[0x24..0x28].copy_from_slice(&500_u32.to_be_bytes());
+        packet[0x28..0x2c].copy_from_slice(&1000_u32.to_be_bytes());
+        packet[0x2c..0x30].copy_from_slice(&2000_u32.to_be_bytes());
+        packet[0x54..0x58].copy_from_slice(&0x0010_0000_u32.to_be_bytes());
+        packet[0x5a..0x5c].copy_from_slice(&bpm_x100.to_be_bytes());
+        packet[0x5c] = beat_in_measure;
+        packet[0x5f] = device_id;
+        packet
+    }
+
+    #[test]
+    fn decode_beat_packet_reads_device_bpm_and_bar_beat() {
+        let packet = synthetic_beat_packet(2, 12850, 3);
+
+        let (device_id, bpm, beat_in_measure) =
+            ProDjLinkClient::decode_beat_packet(&packet).unwrap();
+
+        assert_eq!(device_id, 2);
+        assert!((bpm - 128.5).abs() < f32::EPSILON);
+        assert_eq!(beat_in_measure, 3);
+    }
+
+    #[test]
+    fn parse_beat_updates_existing_master_deck_state() {
+        let state = test_state();
+        {
+            let mut st = state.lock();
+            st.devices.insert(
+                1,
+                CDJDevice {
+                    device_id: 1,
+                    name: "CDJ-3000".to_string(),
+                    ip: "192.168.20.10".parse().unwrap(),
+                    last_seen: Instant::now(),
+                    status: DeckStatus {
+                        is_master: true,
+                        ..DeckStatus::default()
+                    },
+                },
+            );
+        }
+        let packet = synthetic_beat_packet(1, 12400, 1);
+
+        ProDjLinkClient::parse_beat(&packet, "192.168.20.10".parse().unwrap(), &state);
+
+        let st = state.lock();
+        let device = st.devices.get(&1).unwrap();
+        assert_eq!(device.status.bpm, Some(124.0));
+        assert_eq!(device.status.beat_in_measure, 1);
+        assert!(device.status.last_beat_at.is_some());
+    }
+}
